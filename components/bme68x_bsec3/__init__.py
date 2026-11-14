@@ -37,6 +37,11 @@ CODEOWNERS = ["@sweitzja"]
 DEPENDENCIES = ["i2c"]
 AUTO_LOAD = ["sensor", "text_sensor"]
 
+# Name of the generated ESP-IDF component that links the BSEC3 static library.
+# IDF names a component after its directory, so the directory must carry
+# exactly this name.
+BSEC3_IDF_COMPONENT = "bsec_algobsec"
+
 # --- Bosch BSEC v3.3.0.0 (proprietary) ----------------------------------------
 # Downloaded at build time, never redistributed by this repository. The direct
 # URL is the one published on Bosch Sensortec's software downloads page.
@@ -287,7 +292,7 @@ def _write_bsec3_idf_component(extract_dir: Path, lib_file: Path) -> Path:
     the checksum-verified file Bosch published; it is only referenced from
     the cache directory and never copied into this repository.
     """
-    comp_dir = extract_dir / "idf_component_algobsec"
+    comp_dir = extract_dir / BSEC3_IDF_COMPONENT
     comp_dir.mkdir(parents=True, exist_ok=True)
     cmake = (
         "idf_component_register()\n"
@@ -370,8 +375,7 @@ async def to_code(config):
     from esphome.components.esp32 import add_idf_component
 
     idf_comp_dir = _write_bsec3_idf_component(extract_dir, lib_file)
-    # Namespaced name ("namespace/name" -> required as "namespace__name").
-    add_idf_component(name="bme68x/algobsec", path=str(idf_comp_dir))
+    add_idf_component(name=BSEC3_IDF_COMPONENT, path=str(idf_comp_dir))
 
     # Increase main task stack for API encryption + sensor publishing
     from esphome.components.esp32 import add_idf_sdkconfig_option
