@@ -370,7 +370,8 @@ async def to_code(config):
     from esphome.components.esp32 import add_idf_component
 
     idf_comp_dir = _write_bsec3_idf_component(extract_dir, lib_file)
-    add_idf_component(name="bsec_algobsec", path=str(idf_comp_dir))
+    # Namespaced name ("namespace/name" -> required as "namespace__name").
+    add_idf_component(name="bme68x/algobsec", path=str(idf_comp_dir))
 
     # Increase main task stack for API encryption + sensor publishing
     from esphome.components.esp32 import add_idf_sdkconfig_option
