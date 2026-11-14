@@ -277,6 +277,29 @@ def _parse_config_blob(config_path):
     return values
 
 
+def _write_bsec3_idf_component(extract_dir: Path, lib_file: Path) -> Path:
+    """Write a tiny ESP-IDF component that wraps the BSEC3 static library.
+
+    The native ESP-IDF build of recent ESPHome versions ignores the
+    "-L<dir>" / "-lalgobsec" build flags, which leaves every bsec_* symbol
+    undefined at link time. An ESP-IDF component using add_prebuilt_library()
+    is the supported way to link a precompiled archive. The library itself is
+    the checksum-verified file Bosch published; it is only referenced from
+    the cache directory and never copied into this repository.
+    """
+    comp_dir = extract_dir / "idf_component_algobsec"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    cmake = (
+        "idf_component_register()\n"
+        f'add_prebuilt_library(algobsec "{lib_file.as_posix()}")\n'
+        "target_link_libraries(${COMPONENT_LIB} INTERFACE algobsec)\n"
+    )
+    cmake_path = comp_dir / "CMakeLists.txt"
+    if not cmake_path.is_file() or cmake_path.read_text() != cmake:
+        cmake_path.write_text(cmake)
+    return comp_dir
+
+
 @coroutine_with_priority(60.0)
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
@@ -330,20 +353,24 @@ async def to_code(config):
     cg.add(var.set_bsec3_configuration(bsec3_arr, len(config_bytes)))
 
     # Build flags: include paths for the BSEC3 headers and this component
-    # (the latter for the downloaded bme69x.h SensorAPI header).
+    # (the latter for the downloaded bme69x.h SensorAPI header). The headers
+    # are additionally copied next to the sources, see _download_dependencies().
     cg.add_build_flag(f"-I{extract_dir / 'inc'}")
     cg.add_build_flag(f"-I{component_dir}")
 
-    # Link the arch-specific BSEC3 library
+    # Link the arch-specific BSEC3 library through a generated ESP-IDF component
     arch = _get_bsec3_arch()
     lib_path = extract_dir / "bin" / "esp" / arch
-    if not (lib_path / "libalgobsec.a").exists():
+    lib_file = lib_path / "libalgobsec.a"
+    if not lib_file.exists():
         raise cv.Invalid(
             f"BSEC3 library not found for architecture {arch}: {lib_path}\n"
             f"Delete '{extract_dir}' and rebuild to re-download the BSEC3 release."
         )
-    cg.add_build_flag(f"-L{lib_path}")
-    cg.add_build_flag("-lalgobsec")
+    from esphome.components.esp32 import add_idf_component
+
+    idf_comp_dir = _write_bsec3_idf_component(extract_dir, lib_file)
+    add_idf_component(name="bsec_algobsec", path=str(idf_comp_dir))
 
     # Increase main task stack for API encryption + sensor publishing
     from esphome.components.esp32 import add_idf_sdkconfig_option
