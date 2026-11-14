@@ -204,6 +204,18 @@ def _download_dependencies(config):
             )
             external_files.download_content(f"{BME69X_API_BASE}/{fname}", dest)
 
+    # The native ESP-IDF build of recent ESPHome versions does not apply the
+    # "-I<extract_dir>/inc" build flag, so "#include "bsec_interface.h"" is not
+    # found. Copy the (unmodified) BSEC headers next to the component sources,
+    # exactly like the BME69x SensorAPI files above: a quoted include resolves
+    # relative to the including file's directory. The copies are .gitignored.
+    inc_dir = extract_dir / "inc"
+    for header in sorted(inc_dir.glob("*.h")):
+        dest = component_dir / header.name
+        data = header.read_bytes()
+        if not dest.is_file() or dest.read_bytes() != data:
+            dest.write_bytes(data)
+
     return config
 
 
