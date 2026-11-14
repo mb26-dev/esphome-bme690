@@ -4,6 +4,9 @@
  * Runs the BSEC3 algorithm in a dedicated FreeRTOS task. Sensor readings
  * are passed to BSEC which produces IAQ, CO2eq, VOC, and other derived
  * outputs. State is saved to NVS periodically for calibration persistence.
+ *
+ * Patch: all large BSEC work/config/state buffers live on the heap instead of
+ * the (small) ESPHome loop-task stack; this avoids stack overflow at boot.
  */
 
 #include "esphome/core/defines.h"
@@ -13,14 +16,16 @@
 
 #include "esp_timer.h"
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace esphome {
 namespace bme68x_bsec3 {
 
 static const char *const TAG = "bme68x_bsec3";
 
-static const uint32_t BSEC_TASK_STACK_SIZE = 8192;
+static const uint32_t BSEC_TASK_STACK_SIZE = 12288;
 static const uint32_t BSEC_TASK_PRIORITY = 5;
 static const uint32_t BSEC_TASK_STARTUP_DELAY_MS = 5000;
 
@@ -66,7 +71,8 @@ void BME68xBSEC3Component::setup() {
     return;
   }
 
-  // Initialize BME69x device struct
+  // Initialize BME69x device struct (zeroed first so no stray function pointers)
+  memset(&this->bme69x_dev_, 0, sizeof(this->bme69x_dev_));
   this->bme69x_dev_.intf = BME69X_I2C_INTF;
   this->bme69x_dev_.read = i2c_read_;
   this->bme69x_dev_.write = i2c_write_;
@@ -88,14 +94,17 @@ void BME68xBSEC3Component::setup() {
   this->bsec_instance_ = (uint8_t *) malloc(instance_size);
   if (this->bsec_instance_ == nullptr) {
     this->mark_failed();
-    ESP_LOGE(TAG, "Failed to allocate BSEC instance (%u bytes)", instance_size);
+    ESP_LOGE(TAG, "Failed to allocate BSEC instance (%u bytes)", (unsigned) instance_size);
     return;
   }
   memset(this->bsec_instance_, 0, instance_size);
-  ESP_LOGI(TAG, "BSEC instance allocated: %u bytes", instance_size);
+  ESP_LOGI(TAG, "BSEC instance allocated: %u bytes", (unsigned) instance_size);
 
   // Initialize BSEC3 instance
   this->init_bsec_();
+  if (this->is_failed()) {
+    return;
+  }
 
   // Launch dedicated FreeRTOS task for BSEC processing
   auto result = xTaskCreatePinnedToCore(
@@ -111,7 +120,8 @@ void BME68xBSEC3Component::setup() {
 }
 
 void BME68xBSEC3Component::init_bsec_() {
-  uint8_t work_buffer[BSEC_MAX_WORKBUFFER_SIZE];
+  // Large buffers on the heap (BSEC work buffer + config blob are several KB)
+  std::vector<uint8_t> work_buffer(BSEC_MAX_WORKBUFFER_SIZE);
 
   // Initialize BSEC library instance
   bsec_library_return_t bsec_status = bsec_init(this->bsec_instance_);
@@ -129,17 +139,20 @@ void BME68xBSEC3Component::init_bsec_() {
 
   // Apply config blob
   if (this->bsec3_config_data_ != nullptr && this->bsec3_config_length_ > 0) {
-    // Copy from PROGMEM
-    uint8_t config_buf[BSEC_MAX_PROPERTY_BLOB_SIZE];
-    memcpy(config_buf, this->bsec3_config_data_, this->bsec3_config_length_);
+    ESP_LOGI(TAG, "BSEC config blob: %u bytes (max property blob %u, work buffer %u)",
+             (unsigned) this->bsec3_config_length_, (unsigned) BSEC_MAX_PROPERTY_BLOB_SIZE,
+             (unsigned) BSEC_MAX_WORKBUFFER_SIZE);
+    size_t cfg_size = std::max<size_t>(this->bsec3_config_length_, BSEC_MAX_PROPERTY_BLOB_SIZE);
+    std::vector<uint8_t> config_buf(cfg_size);
+    memcpy(config_buf.data(), this->bsec3_config_data_, this->bsec3_config_length_);
 
     bsec_status = bsec_set_configuration(
-        this->bsec_instance_, config_buf, this->bsec3_config_length_,
-        work_buffer, sizeof(work_buffer));
+        this->bsec_instance_, config_buf.data(), this->bsec3_config_length_,
+        work_buffer.data(), work_buffer.size());
     if (bsec_status != BSEC_OK) {
       ESP_LOGW(TAG, "BSEC set_configuration failed: %d", bsec_status);
     } else {
-      ESP_LOGI(TAG, "BSEC config applied (%u bytes)", this->bsec3_config_length_);
+      ESP_LOGI(TAG, "BSEC config applied (%u bytes)", (unsigned) this->bsec3_config_length_);
     }
   }
 
@@ -289,7 +302,7 @@ void BME68xBSEC3Component::bsec_task_main_() {
       // Read sensor data and process through BSEC
       if (sensor_settings.trigger_measurement && sensor_settings.op_mode != BME69X_SLEEP_MODE) {
         n_fields = 0;
-        int8_t bme_status = bme69x_get_data(
+        bme69x_get_data(
             this->last_op_mode_, &sensor_data[0], &n_fields, &this->bme69x_dev_);
 
         for (uint8_t i = 0; i < n_fields; i++) {
@@ -528,42 +541,48 @@ void BME68xBSEC3Component::update() {
 
 // --- State Persistence ---
 
+typedef uint8_t BsecStateBlob[BSEC_MAX_STATE_BLOB_SIZE];
+
 void BME68xBSEC3Component::save_state_() {
-  uint8_t state_buffer[BSEC_MAX_STATE_BLOB_SIZE];
-  uint8_t work_buffer[BSEC_MAX_WORKBUFFER_SIZE];
+  std::vector<uint8_t> state_buffer(BSEC_MAX_STATE_BLOB_SIZE);
+  std::vector<uint8_t> work_buffer(BSEC_MAX_WORKBUFFER_SIZE);
   uint32_t state_length = 0;
 
   bsec_library_return_t status = bsec_get_state(
-      this->bsec_instance_, 0, state_buffer, sizeof(state_buffer),
-      work_buffer, sizeof(work_buffer), &state_length);
+      this->bsec_instance_, 0, state_buffer.data(), state_buffer.size(),
+      work_buffer.data(), work_buffer.size(), &state_length);
   if (status != BSEC_OK) {
     ESP_LOGW(TAG, "Failed to get BSEC state: %d", status);
     return;
   }
+  if (state_length > BSEC_MAX_STATE_BLOB_SIZE) {
+    ESP_LOGW(TAG, "BSEC state too large: %u", (unsigned) state_length);
+    return;
+  }
 
   // Save to NVS via ESPHome preferences
-  auto pref = global_preferences->make_preference<uint8_t[BSEC_MAX_STATE_BLOB_SIZE]>(BSEC_STATE_HASH);
-  uint8_t save_buf[BSEC_MAX_STATE_BLOB_SIZE]{};
-  memcpy(save_buf, state_buffer, state_length);
-  pref.save(&save_buf);
+  auto pref = global_preferences->make_preference<BsecStateBlob>(BSEC_STATE_HASH);
+  std::vector<uint8_t> save_buf(BSEC_MAX_STATE_BLOB_SIZE, 0);
+  memcpy(save_buf.data(), state_buffer.data(), state_length);
+  pref.save(reinterpret_cast<BsecStateBlob *>(save_buf.data()));
   global_preferences->sync();
 
-  ESP_LOGI(TAG, "BSEC state saved (%u bytes)", state_length);
+  ESP_LOGI(TAG, "BSEC state saved (%u bytes)", (unsigned) state_length);
 }
 
 void BME68xBSEC3Component::load_state_() {
-  auto pref = global_preferences->make_preference<uint8_t[BSEC_MAX_STATE_BLOB_SIZE]>(BSEC_STATE_HASH);
-  uint8_t state_buffer[BSEC_MAX_STATE_BLOB_SIZE]{};
+  auto pref = global_preferences->make_preference<BsecStateBlob>(BSEC_STATE_HASH);
+  std::vector<uint8_t> state_buffer(BSEC_MAX_STATE_BLOB_SIZE, 0);
 
-  if (!pref.load(&state_buffer)) {
+  if (!pref.load(reinterpret_cast<BsecStateBlob *>(state_buffer.data()))) {
     ESP_LOGI(TAG, "No saved BSEC state found");
     return;
   }
 
-  uint8_t work_buffer[BSEC_MAX_WORKBUFFER_SIZE];
+  std::vector<uint8_t> work_buffer(BSEC_MAX_WORKBUFFER_SIZE);
   bsec_library_return_t status = bsec_set_state(
-      this->bsec_instance_, state_buffer, BSEC_MAX_STATE_BLOB_SIZE,
-      work_buffer, sizeof(work_buffer));
+      this->bsec_instance_, state_buffer.data(), BSEC_MAX_STATE_BLOB_SIZE,
+      work_buffer.data(), work_buffer.size());
   if (status != BSEC_OK) {
     ESP_LOGW(TAG, "Failed to restore BSEC state: %d", status);
   } else {
@@ -580,12 +599,14 @@ void BME68xBSEC3Component::dump_config() {
   ESP_LOGCONFIG(TAG, "  Supply Voltage: %s", this->supply_voltage_ == SUPPLY_VOLTAGE_3V3 ? "3.3V" : "1.8V");
   ESP_LOGCONFIG(TAG, "  Operating Age: %s", this->operating_age_ == OPERATING_AGE_28D ? "28 days" : "4 days");
   ESP_LOGCONFIG(TAG, "  Temperature Offset: %.2f", this->temperature_offset_);
-  ESP_LOGCONFIG(TAG, "  State Save Interval: %us", this->state_save_interval_ms_ / 1000);
+  ESP_LOGCONFIG(TAG, "  State Save Interval: %us", (unsigned) (this->state_save_interval_ms_ / 1000));
 
-  bsec_version_t version;
-  if (bsec_get_version(this->bsec_instance_, &version) == BSEC_OK) {
-    ESP_LOGCONFIG(TAG, "  BSEC Version: %d.%d.%d.%d", version.major, version.minor,
-                  version.major_bugfix, version.minor_bugfix);
+  if (this->bsec_instance_ != nullptr) {
+    bsec_version_t version;
+    if (bsec_get_version(this->bsec_instance_, &version) == BSEC_OK) {
+      ESP_LOGCONFIG(TAG, "  BSEC Version: %d.%d.%d.%d", version.major, version.minor,
+                    version.major_bugfix, version.minor_bugfix);
+    }
   }
 
   LOG_I2C_DEVICE(this);
