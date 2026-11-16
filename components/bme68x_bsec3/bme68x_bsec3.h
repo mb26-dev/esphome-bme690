@@ -122,6 +122,8 @@ class BME68xBSEC3Component : public PollingComponent, public i2c::I2CDevice {
     float tvoc_equivalent{0};
     float compensated_temperature{0};
     float compensated_humidity{0};
+    float stabilization_status{0};
+    float run_in_status{0};
     bool valid{false};
   };
   SensorData sensor_data_{};
@@ -144,6 +146,11 @@ class BME68xBSEC3Component : public PollingComponent, public i2c::I2CDevice {
   uint32_t last_state_save_ms_{0};
   // Latest IAQ accuracy reported by BSEC (written by the BSEC task)
   volatile uint8_t last_accuracy_{0};
+
+  // Start-up gate for the IAQ outputs (main loop only)
+  uint32_t iaq_first_nonzero_ms_{0};
+  bool iaq_seen_nonzero_{false};
+  bool iaq_ready_{false};
 
 
   // Sensors

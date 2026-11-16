@@ -7,8 +7,9 @@
  *   - periodically (state_save_interval), but only while IAQ accuracy is 3,
  *     so a degraded state never overwrites a good calibration;
  *   - on safe shutdown (OTA update, restart button, API/WiFi reboot timeout).
- * While BSEC is stabilizing (accuracy 0, ~5 min after boot) the IAQ-derived
- * values are published as unknown instead of a misleading ramp from 0.
+ * After boot the IAQ-derived values are published as unknown until BSEC has
+ * finished its start-up ramp (accuracy 0, then IAQ climbing from 0), instead
+ * of misleading low values.
  *
  * Patch: all large BSEC work/config/state buffers live on the heap instead of
  * the (small) ESPHome loop-task stack; this avoids stack overflow at boot.
@@ -16,6 +17,7 @@
 
 #include "esphome/core/defines.h"
 #include "bme68x_bsec3.h"
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "esphome/core/preferences.h"
 
@@ -35,6 +37,8 @@ static const uint32_t BSEC_TASK_STACK_SIZE = 12288;
 static const uint32_t BSEC_TASK_PRIORITY = 5;
 static const uint32_t BSEC_TASK_STARTUP_DELAY_MS = 5000;
 static const uint32_t BSEC_SHUTDOWN_LOCK_TIMEOUT_MS = 3000;
+// BSEC ramps IAQ up from 0 for about a minute after the first non-zero output
+static const uint32_t IAQ_RAMP_HOLD_MS = 90000;
 
 // NVS key for BSEC state persistence
 static const uint32_t BSEC_STATE_HASH = 0xB5EC0003;
@@ -456,6 +460,12 @@ void BME68xBSEC3Component::process_sensor_data_(int64_t time_ns, struct bme69x_d
       case BSEC_OUTPUT_TVOC_EQUIVALENT:
         new_data.tvoc_equivalent = outputs[i].signal;
         break;
+      case BSEC_OUTPUT_STABILIZATION_STATUS:
+        new_data.stabilization_status = outputs[i].signal;
+        break;
+      case BSEC_OUTPUT_RUN_IN_STATUS:
+        new_data.run_in_status = outputs[i].signal;
+        break;
       default:
         break;
     }
@@ -493,13 +503,27 @@ void BME68xBSEC3Component::update() {
     xSemaphoreGive(this->data_mutex_);
   }
 
-  // Accuracy 0 = BSEC is stabilizing (first ~5 min after boot, also with a
-  // restored state): the IAQ-derived outputs ramp up from 0 and mean nothing yet.
-  const bool stabilizing = data.iaq_accuracy == 0;
+  // Start-up gate: after boot BSEC first reports accuracy 0, then IAQ sits at 0
+  // and ramps up for about a minute (also with a restored state). The IAQ
+  // outputs are released once a non-zero static IAQ has been seen for 90 s;
+  // after that only accuracy 0 (stabilizing) hides them again.
+  const uint32_t now_ms = millis();
+  if (!this->iaq_ready_) {
+    if (!this->iaq_seen_nonzero_ && data.iaq_accuracy > 0 && data.static_iaq > 0.0f) {
+      this->iaq_seen_nonzero_ = true;
+      this->iaq_first_nonzero_ms_ = now_ms;
+    }
+    if (this->iaq_seen_nonzero_ && now_ms - this->iaq_first_nonzero_ms_ >= IAQ_RAMP_HOLD_MS) {
+      this->iaq_ready_ = true;
+      ESP_LOGI(TAG, "BSEC start-up ramp finished, publishing IAQ");
+    }
+  }
+  const bool hide_iaq = !this->iaq_ready_ || data.iaq_accuracy == 0;
 
-  ESP_LOGI(TAG, "T=%.1f H=%.1f P=%.1f IAQ=%.0f acc=%d%s",
+  ESP_LOGI(TAG, "T=%.1f H=%.1f P=%.1f IAQ=%.0f sIAQ=%.0f acc=%d stab=%.0f runin=%.0f%s",
            data.compensated_temperature, data.compensated_humidity, data.pressure,
-           data.iaq, data.iaq_accuracy, stabilizing ? " (stabilizing, IAQ hidden)" : "");
+           data.iaq, data.static_iaq, data.iaq_accuracy, data.stabilization_status,
+           data.run_in_status, hide_iaq ? " (IAQ hidden)" : "");
 
 #ifdef USE_SENSOR
   if (this->temperature_sensor_ != nullptr)
@@ -511,19 +535,19 @@ void BME68xBSEC3Component::update() {
   if (this->gas_resistance_sensor_ != nullptr)
     this->gas_resistance_sensor_->publish_state(data.gas_resistance);
   if (this->iaq_sensor_ != nullptr)
-    this->iaq_sensor_->publish_state(stabilizing ? NAN : data.iaq);
+    this->iaq_sensor_->publish_state(hide_iaq ? NAN : data.iaq);
   if (this->iaq_accuracy_sensor_ != nullptr)
     this->iaq_accuracy_sensor_->publish_state((float) data.iaq_accuracy);
   if (this->static_iaq_sensor_ != nullptr)
-    this->static_iaq_sensor_->publish_state(stabilizing ? NAN : data.static_iaq);
+    this->static_iaq_sensor_->publish_state(hide_iaq ? NAN : data.static_iaq);
   if (this->co2_equivalent_sensor_ != nullptr)
-    this->co2_equivalent_sensor_->publish_state(stabilizing ? NAN : data.co2_equivalent);
+    this->co2_equivalent_sensor_->publish_state(hide_iaq ? NAN : data.co2_equivalent);
   if (this->breath_voc_equivalent_sensor_ != nullptr)
-    this->breath_voc_equivalent_sensor_->publish_state(stabilizing ? NAN : data.breath_voc_equivalent);
+    this->breath_voc_equivalent_sensor_->publish_state(hide_iaq ? NAN : data.breath_voc_equivalent);
   if (this->gas_percentage_sensor_ != nullptr)
-    this->gas_percentage_sensor_->publish_state(stabilizing ? NAN : data.gas_percentage);
+    this->gas_percentage_sensor_->publish_state(hide_iaq ? NAN : data.gas_percentage);
   if (this->tvoc_equivalent_sensor_ != nullptr)
-    this->tvoc_equivalent_sensor_->publish_state(stabilizing ? NAN : data.tvoc_equivalent);
+    this->tvoc_equivalent_sensor_->publish_state(hide_iaq ? NAN : data.tvoc_equivalent);
   if (this->compensated_temperature_sensor_ != nullptr)
     this->compensated_temperature_sensor_->publish_state(data.temperature);
   if (this->compensated_humidity_sensor_ != nullptr)
@@ -532,16 +556,20 @@ void BME68xBSEC3Component::update() {
 #ifdef USE_TEXT_SENSOR
   if (this->iaq_accuracy_text_sensor_ != nullptr) {
     const char *accuracy_text;
-    switch (data.iaq_accuracy) {
-      case 0: accuracy_text = "Stabilizing"; break;
-      case 1: accuracy_text = "Uncertain"; break;
-      case 2: accuracy_text = "Calibrating"; break;
-      case 3: accuracy_text = "Calibrated"; break;
-      default: accuracy_text = "Unknown"; break;
+    if (!this->iaq_ready_ && data.iaq_accuracy > 0) {
+      accuracy_text = "Starting";
+    } else {
+      switch (data.iaq_accuracy) {
+        case 0: accuracy_text = "Stabilizing"; break;
+        case 1: accuracy_text = "Uncertain"; break;
+        case 2: accuracy_text = "Calibrating"; break;
+        case 3: accuracy_text = "Calibrated"; break;
+        default: accuracy_text = "Unknown"; break;
+      }
     }
     this->iaq_accuracy_text_sensor_->publish_state(accuracy_text);
   }
-  if (this->iaq_description_text_sensor_ != nullptr && !stabilizing) {
+  if (this->iaq_description_text_sensor_ != nullptr && !hide_iaq) {
     const char *desc;
     if (data.iaq <= 50)
       desc = "Excellent";
