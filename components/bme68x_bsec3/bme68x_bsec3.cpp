@@ -3,7 +3,12 @@
  *
  * Runs the BSEC3 algorithm in a dedicated FreeRTOS task. Sensor readings
  * are passed to BSEC which produces IAQ, CO2eq, VOC, and other derived
- * outputs. State is saved to NVS periodically for calibration persistence.
+ * outputs. State is saved to NVS for calibration persistence:
+ *   - periodically (state_save_interval), but only while IAQ accuracy is 3,
+ *     so a degraded state never overwrites a good calibration;
+ *   - on safe shutdown (OTA update, restart button, API/WiFi reboot timeout).
+ * While BSEC is stabilizing (accuracy 0, ~5 min after boot) the IAQ-derived
+ * values are published as unknown instead of a misleading ramp from 0.
  *
  * Patch: all large BSEC work/config/state buffers live on the heap instead of
  * the (small) ESPHome loop-task stack; this avoids stack overflow at boot.
@@ -17,6 +22,7 @@
 #include "esp_timer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -28,6 +34,7 @@ static const char *const TAG = "bme68x_bsec3";
 static const uint32_t BSEC_TASK_STACK_SIZE = 12288;
 static const uint32_t BSEC_TASK_PRIORITY = 5;
 static const uint32_t BSEC_TASK_STARTUP_DELAY_MS = 5000;
+static const uint32_t BSEC_SHUTDOWN_LOCK_TIMEOUT_MS = 3000;
 
 // NVS key for BSEC state persistence
 static const uint32_t BSEC_STATE_HASH = 0xB5EC0003;
@@ -63,9 +70,10 @@ float BME68xBSEC3Component::get_setup_priority() const {
 void BME68xBSEC3Component::setup() {
   ESP_LOGCONFIG(TAG, "Setting up BME68x BSEC3...");
 
-  // Create mutex for shared sensor data
+  // Create mutexes for shared sensor data and for the BSEC library itself
   this->data_mutex_ = xSemaphoreCreateMutex();
-  if (this->data_mutex_ == nullptr) {
+  this->bsec_mutex_ = xSemaphoreCreateMutex();
+  if (this->data_mutex_ == nullptr || this->bsec_mutex_ == nullptr) {
     this->mark_failed();
     ESP_LOGE(TAG, "Failed to create mutex");
     return;
@@ -236,10 +244,15 @@ void BME68xBSEC3Component::bsec_task_main_() {
     int64_t time_ns = (int64_t) esp_timer_get_time() * INT64_C(1000);
 
     if (time_ns >= sensor_settings.next_call) {
+      // All BSEC library calls of one cycle run under the BSEC mutex, so the
+      // shutdown hook can never interrupt the algorithm in the middle of a step.
+      xSemaphoreTake(this->bsec_mutex_, portMAX_DELAY);
+
       // Get BSEC sensor control settings
       bsec_library_return_t status = bsec_sensor_control(
           this->bsec_instance_, time_ns, &sensor_settings);
       if (status != BSEC_OK) {
+        xSemaphoreGive(this->bsec_mutex_);
         ESP_LOGW(TAG, "bsec_sensor_control error: %d", status);
         vTaskDelay(pdMS_TO_TICKS(1000));
         continue;
@@ -312,12 +325,17 @@ void BME68xBSEC3Component::bsec_task_main_() {
         }
       }
 
-      // Periodic state save
+      // Periodic state save - only with a fully calibrated state (accuracy 3).
+      // If the interval is due while BSEC is still calibrating, the save is
+      // retried every cycle until accuracy reaches 3 again.
       uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-      if (now_ms - this->last_state_save_ms_ >= this->state_save_interval_ms_) {
-        this->save_state_();
-        this->last_state_save_ms_ = now_ms;
+      if (now_ms - this->last_state_save_ms_ >= this->state_save_interval_ms_ && this->last_accuracy_ >= 3) {
+        if (this->save_state_()) {
+          this->last_state_save_ms_ = now_ms;
+        }
       }
+
+      xSemaphoreGive(this->bsec_mutex_);
     }
 
     // Sleep until next BSEC call
@@ -415,6 +433,7 @@ void BME68xBSEC3Component::process_sensor_data_(int64_t time_ns, struct bme69x_d
       case BSEC_OUTPUT_IAQ:
         new_data.iaq = outputs[i].signal;
         new_data.iaq_accuracy = outputs[i].accuracy;
+        this->last_accuracy_ = outputs[i].accuracy;
         break;
       case BSEC_OUTPUT_STATIC_IAQ:
         new_data.static_iaq = outputs[i].signal;
@@ -474,9 +493,13 @@ void BME68xBSEC3Component::update() {
     xSemaphoreGive(this->data_mutex_);
   }
 
-  ESP_LOGI(TAG, "T=%.1f H=%.1f P=%.1f IAQ=%.0f acc=%d",
+  // Accuracy 0 = BSEC is stabilizing (first ~5 min after boot, also with a
+  // restored state): the IAQ-derived outputs ramp up from 0 and mean nothing yet.
+  const bool stabilizing = data.iaq_accuracy == 0;
+
+  ESP_LOGI(TAG, "T=%.1f H=%.1f P=%.1f IAQ=%.0f acc=%d%s",
            data.compensated_temperature, data.compensated_humidity, data.pressure,
-           data.iaq, data.iaq_accuracy);
+           data.iaq, data.iaq_accuracy, stabilizing ? " (stabilizing, IAQ hidden)" : "");
 
 #ifdef USE_SENSOR
   if (this->temperature_sensor_ != nullptr)
@@ -488,19 +511,19 @@ void BME68xBSEC3Component::update() {
   if (this->gas_resistance_sensor_ != nullptr)
     this->gas_resistance_sensor_->publish_state(data.gas_resistance);
   if (this->iaq_sensor_ != nullptr)
-    this->iaq_sensor_->publish_state(data.iaq);
+    this->iaq_sensor_->publish_state(stabilizing ? NAN : data.iaq);
   if (this->iaq_accuracy_sensor_ != nullptr)
     this->iaq_accuracy_sensor_->publish_state((float) data.iaq_accuracy);
   if (this->static_iaq_sensor_ != nullptr)
-    this->static_iaq_sensor_->publish_state(data.static_iaq);
+    this->static_iaq_sensor_->publish_state(stabilizing ? NAN : data.static_iaq);
   if (this->co2_equivalent_sensor_ != nullptr)
-    this->co2_equivalent_sensor_->publish_state(data.co2_equivalent);
+    this->co2_equivalent_sensor_->publish_state(stabilizing ? NAN : data.co2_equivalent);
   if (this->breath_voc_equivalent_sensor_ != nullptr)
-    this->breath_voc_equivalent_sensor_->publish_state(data.breath_voc_equivalent);
+    this->breath_voc_equivalent_sensor_->publish_state(stabilizing ? NAN : data.breath_voc_equivalent);
   if (this->gas_percentage_sensor_ != nullptr)
-    this->gas_percentage_sensor_->publish_state(data.gas_percentage);
+    this->gas_percentage_sensor_->publish_state(stabilizing ? NAN : data.gas_percentage);
   if (this->tvoc_equivalent_sensor_ != nullptr)
-    this->tvoc_equivalent_sensor_->publish_state(data.tvoc_equivalent);
+    this->tvoc_equivalent_sensor_->publish_state(stabilizing ? NAN : data.tvoc_equivalent);
   if (this->compensated_temperature_sensor_ != nullptr)
     this->compensated_temperature_sensor_->publish_state(data.temperature);
   if (this->compensated_humidity_sensor_ != nullptr)
@@ -518,7 +541,7 @@ void BME68xBSEC3Component::update() {
     }
     this->iaq_accuracy_text_sensor_->publish_state(accuracy_text);
   }
-  if (this->iaq_description_text_sensor_ != nullptr) {
+  if (this->iaq_description_text_sensor_ != nullptr && !stabilizing) {
     const char *desc;
     if (data.iaq <= 50)
       desc = "Excellent";
@@ -539,11 +562,34 @@ void BME68xBSEC3Component::update() {
 #endif
 }
 
+// --- Safe shutdown (OTA, restart button, API/WiFi reboot timeout) ---
+
+void BME68xBSEC3Component::on_safe_shutdown() {
+  if (this->bsec_instance_ == nullptr || this->bsec_mutex_ == nullptr || this->task_handle_ == nullptr) {
+    return;
+  }
+  // Wait until the BSEC task has finished its current cycle, then stop it so
+  // the instance cannot change while the state is read.
+  if (xSemaphoreTake(this->bsec_mutex_, pdMS_TO_TICKS(BSEC_SHUTDOWN_LOCK_TIMEOUT_MS)) != pdTRUE) {
+    ESP_LOGW(TAG, "Shutdown: BSEC busy, state not saved");
+    return;
+  }
+  vTaskSuspend(this->task_handle_);
+  if (this->last_accuracy_ >= 3) {
+    ESP_LOGI(TAG, "Shutdown: saving calibrated BSEC state");
+    this->save_state_();
+  } else {
+    ESP_LOGI(TAG, "Shutdown: IAQ accuracy %d < 3, keeping the last calibrated state",
+             (int) this->last_accuracy_);
+  }
+  xSemaphoreGive(this->bsec_mutex_);
+}
+
 // --- State Persistence ---
 
 typedef uint8_t BsecStateBlob[BSEC_MAX_STATE_BLOB_SIZE];
 
-void BME68xBSEC3Component::save_state_() {
+bool BME68xBSEC3Component::save_state_() {
   std::vector<uint8_t> state_buffer(BSEC_MAX_STATE_BLOB_SIZE);
   std::vector<uint8_t> work_buffer(BSEC_MAX_WORKBUFFER_SIZE);
   uint32_t state_length = 0;
@@ -553,21 +599,26 @@ void BME68xBSEC3Component::save_state_() {
       work_buffer.data(), work_buffer.size(), &state_length);
   if (status != BSEC_OK) {
     ESP_LOGW(TAG, "Failed to get BSEC state: %d", status);
-    return;
+    return false;
   }
-  if (state_length > BSEC_MAX_STATE_BLOB_SIZE) {
-    ESP_LOGW(TAG, "BSEC state too large: %u", (unsigned) state_length);
-    return;
+  if (state_length == 0 || state_length > BSEC_MAX_STATE_BLOB_SIZE) {
+    ESP_LOGW(TAG, "BSEC state has invalid size: %u", (unsigned) state_length);
+    return false;
   }
 
   // Save to NVS via ESPHome preferences
   auto pref = global_preferences->make_preference<BsecStateBlob>(BSEC_STATE_HASH);
   std::vector<uint8_t> save_buf(BSEC_MAX_STATE_BLOB_SIZE, 0);
   memcpy(save_buf.data(), state_buffer.data(), state_length);
-  pref.save(reinterpret_cast<BsecStateBlob *>(save_buf.data()));
+  if (!pref.save(reinterpret_cast<BsecStateBlob *>(save_buf.data()))) {
+    ESP_LOGW(TAG, "Failed to write BSEC state to flash");
+    return false;
+  }
   global_preferences->sync();
 
-  ESP_LOGI(TAG, "BSEC state saved (%u bytes)", (unsigned) state_length);
+  ESP_LOGI(TAG, "BSEC state saved (%u bytes, accuracy %d)", (unsigned) state_length,
+           (int) this->last_accuracy_);
+  return true;
 }
 
 void BME68xBSEC3Component::load_state_() {
@@ -599,7 +650,8 @@ void BME68xBSEC3Component::dump_config() {
   ESP_LOGCONFIG(TAG, "  Supply Voltage: %s", this->supply_voltage_ == SUPPLY_VOLTAGE_3V3 ? "3.3V" : "1.8V");
   ESP_LOGCONFIG(TAG, "  Operating Age: %s", this->operating_age_ == OPERATING_AGE_28D ? "28 days" : "4 days");
   ESP_LOGCONFIG(TAG, "  Temperature Offset: %.2f", this->temperature_offset_);
-  ESP_LOGCONFIG(TAG, "  State Save Interval: %us", (unsigned) (this->state_save_interval_ms_ / 1000));
+  ESP_LOGCONFIG(TAG, "  State Save Interval: %us (only at IAQ accuracy 3, plus on safe shutdown)",
+                (unsigned) (this->state_save_interval_ms_ / 1000));
 
   if (this->bsec_instance_ != nullptr) {
     bsec_version_t version;

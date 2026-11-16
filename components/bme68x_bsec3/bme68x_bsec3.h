@@ -45,6 +45,8 @@ class BME68xBSEC3Component : public PollingComponent, public i2c::I2CDevice {
   void update() override;
   void dump_config() override;
   float get_setup_priority() const override;
+  // Saves the BSEC state before OTA updates, restart button and API/WiFi reboots
+  void on_safe_shutdown() override;
 
   // Config setters
   void set_sample_rate(SampleRate rate) { this->sample_rate_ = rate; }
@@ -87,7 +89,7 @@ class BME68xBSEC3Component : public PollingComponent, public i2c::I2CDevice {
   void init_bsec_();
   void subscribe_outputs_();
   void process_sensor_data_(int64_t time_ns, struct bme69x_data *data, uint32_t process_data);
-  void save_state_();
+  bool save_state_();
   void load_state_();
 
   // BME69x I2C callbacks
@@ -125,6 +127,8 @@ class BME68xBSEC3Component : public PollingComponent, public i2c::I2CDevice {
   SensorData sensor_data_{};
   volatile bool data_available_{false};
   SemaphoreHandle_t data_mutex_{nullptr};
+  // Serializes every BSEC library call between the BSEC task and the shutdown hook
+  SemaphoreHandle_t bsec_mutex_{nullptr};
   TaskHandle_t task_handle_{nullptr};
 
   // Config
@@ -138,6 +142,8 @@ class BME68xBSEC3Component : public PollingComponent, public i2c::I2CDevice {
   // State persistence
   uint32_t state_save_interval_ms_{21600000};  // 6 hours
   uint32_t last_state_save_ms_{0};
+  // Latest IAQ accuracy reported by BSEC (written by the BSEC task)
+  volatile uint8_t last_accuracy_{0};
 
 
   // Sensors
